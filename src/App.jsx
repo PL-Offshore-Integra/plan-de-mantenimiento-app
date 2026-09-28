@@ -1,5 +1,7 @@
 import { useState, useEffect, useCallback, useMemo } from "react";
 import { createPortal } from "react-dom";
+import jsPDF from "jspdf";
+import autoTable from "jspdf-autotable";
 import { supabase } from "./lib/supabase";
 import { TAXONOMIA_TECNICA } from "./lib/taxonomiaTecnica";
 
@@ -509,6 +511,17 @@ const api = {
     if (error) throw error;
     return data || [];
   },
+  async getEjecucionesPorTareas(tareaIds) {
+    if (!tareaIds.length) return [];
+    const { data, error } = await supabase
+      .from("mant_ejecuciones")
+      .select("tarea_id, fecha, horas_equipo")
+      .in("tarea_id", tareaIds)
+      .order("fecha", { ascending: false })
+      .order("created_at", { ascending: false });
+    if (error) throw error;
+    return data || [];
+  },
   async getHorasEnFecha(buqueId, equipoId, fecha) {
     // Puede haber más de un registro cargado el mismo día (correcciones); se toma
     // el más reciente, igual que getUltimasHoras.
@@ -808,19 +821,12 @@ function CumplirTareaModal({ tarea, esGerente, nombreUsuario, onClose, onSave })
   );
 }
 
-//  MODAL: HISTORIAL DE CUMPLIMIENTO DE UNA TAREA
-function HistorialTareaModal({ tarea, onClose }) {
-  const [ejecuciones, setEjecuciones] = useState([]);
-  const [loading, setLoading] = useState(true);
-
-  useEffect(() => {
-    api.getEjecucionesPorTarea(tarea.id).then(d => { setEjecuciones(d); setLoading(false); });
-  }, [tarea.id]);
-
-  // Cada cumplimiento se compara contra el anterior para ver si se cumplió a
-  // tiempo: por horas, contra horas_equipo + frecuencia_hs; por fecha, contra
-  // fecha + frecuencia (interpretada en días). El primero de la lista no tiene
-  // referencia previa, así que no se puede evaluar.
+// Cada cumplimiento se compara contra el anterior para ver si se cumplió a
+// tiempo: por horas, contra horas_equipo + frecuencia_hs; por fecha, contra
+// fecha + frecuencia (interpretada en días). El primero de la lista no tiene
+// referencia previa, así que no se puede evaluar. Recibe ejecuciones en
+// cualquier orden y devuelve más reciente primero.
+function calcularCumplimientos(ejecuciones, tarea) {
   const ascendente = [...ejecuciones].sort((a, b) => a.fecha < b.fecha ? -1 : a.fecha > b.fecha ? 1 : 0);
   const diasFrecuencia = tarea.tipo_frecuencia !== "horas" ? parseFrecuenciaDias(tarea.frecuencia_texto) : null;
   const conCumplimiento = ascendente.map((e, i) => {
@@ -836,7 +842,19 @@ function HistorialTareaModal({ tarea, onClose }) {
     }
     return { ...e, cumplimiento: null };
   });
-  const paraMostrar = [...conCumplimiento].reverse();
+  return conCumplimiento.reverse();
+}
+
+//  MODAL: HISTORIAL DE CUMPLIMIENTO DE UNA TAREA
+function HistorialTareaModal({ tarea, onClose }) {
+  const [ejecuciones, setEjecuciones] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    api.getEjecucionesPorTarea(tarea.id).then(d => { setEjecuciones(d); setLoading(false); });
+  }, [tarea.id]);
+
+  const paraMostrar = calcularCumplimientos(ejecuciones, tarea);
 
   return (
     <div className="overlay" onClick={e => e.target === e.currentTarget && onClose()}>
@@ -1430,11 +1448,28 @@ function contarTareas(nodo) {
   return total;
 }
 
-function FilaTarea({ t, ESTADO_BADGE, ESTADO_LABEL, notify, reload, esGerente, nombreUsuario }) {
+// Recorre el árbol acumulando las tareas efectivamente seleccionadas: si un
+// nodo (equipo/subsistema) está en `seleccionados`, todas sus tareas y las de
+// sus hijos entran aunque no estén individualmente marcadas.
+function recolectarSeleccionadas(nodo, heredado, seleccionados, out) {
+  const efectivo = heredado || seleccionados.has(nodo.codigo);
+  for (const t of nodo.tareas) {
+    if (efectivo || seleccionados.has(t.id)) out.push(t);
+  }
+  for (const hijo of nodo.children.values()) recolectarSeleccionadas(hijo, efectivo, seleccionados, out);
+}
+
+function FilaTarea({ t, ESTADO_BADGE, ESTADO_LABEL, notify, reload, esGerente, nombreUsuario, modoSeleccion, seleccionados, onToggleSeleccion, heredado }) {
   const [modalCumplir, setModalCumplir] = useState(false);
   const [modalHistorial, setModalHistorial] = useState(false);
+  const seleccionado = heredado || seleccionados?.has(t.id);
   return (
     <tr>
+      {modoSeleccion && (
+        <td>
+          <input type="checkbox" checked={!!seleccionado} disabled={heredado} onChange={() => onToggleSeleccion(t.id)} />
+        </td>
+      )}
       <td className="text-mono" style={{ fontSize: 10, color: "var(--muted)" }}>{t.codigo || "—"}</td>
       <td style={{ fontSize: 12 }}>{t.descripcion}</td>
       <td className="text-mono" style={{ fontSize: 11, color: "var(--blue)" }}>{t.tipo_frecuencia === "horas" ? `${t.frecuencia_hs} hs` : t.frecuencia_texto}</td>
@@ -1464,40 +1499,297 @@ function FilaTarea({ t, ESTADO_BADGE, ESTADO_LABEL, notify, reload, esGerente, n
   );
 }
 
-function TablaTareas({ tareas, ESTADO_BADGE, ESTADO_LABEL, notify, reload, esGerente, nombreUsuario }) {
+function TablaTareas({ tareas, ESTADO_BADGE, ESTADO_LABEL, notify, reload, esGerente, nombreUsuario, modoSeleccion, seleccionados, onToggleSeleccion, heredado }) {
   return (
     <div className="table-wrap">
       <table>
-        <thead><tr><th>Código</th><th>Descripción</th><th>Frecuencia</th><th>Horas actuales</th><th>Restante</th><th>Estado</th><th>Crítica</th><th></th></tr></thead>
-        <tbody>{tareas.map(t => <FilaTarea key={t.id} t={t} ESTADO_BADGE={ESTADO_BADGE} ESTADO_LABEL={ESTADO_LABEL} notify={notify} reload={reload} esGerente={esGerente} nombreUsuario={nombreUsuario} />)}</tbody>
+        <thead><tr>{modoSeleccion && <th></th>}<th>Código</th><th>Descripción</th><th>Frecuencia</th><th>Horas actuales</th><th>Restante</th><th>Estado</th><th>Crítica</th><th></th></tr></thead>
+        <tbody>{tareas.map(t => <FilaTarea key={t.id} t={t} ESTADO_BADGE={ESTADO_BADGE} ESTADO_LABEL={ESTADO_LABEL} notify={notify} reload={reload} esGerente={esGerente} nombreUsuario={nombreUsuario} modoSeleccion={modoSeleccion} seleccionados={seleccionados} onToggleSeleccion={onToggleSeleccion} heredado={heredado} />)}</tbody>
       </table>
     </div>
   );
 }
 
-function NodoArbol({ nodo, depth, expandido, alternar, forzarAbierto, ESTADO_BADGE, ESTADO_LABEL, notify, reload, esGerente, nombreUsuario }) {
+function NodoArbol({ nodo, depth, expandido, alternar, forzarAbierto, ESTADO_BADGE, ESTADO_LABEL, notify, reload, esGerente, nombreUsuario, modoSeleccion, seleccionados, onToggleSeleccion, heredado }) {
   const abierto = forzarAbierto || expandido.has(nodo.codigo);
   const hijos = [...nodo.children.values()].sort((a, b) => compararCodigos(a.codigo, b.codigo));
+  const seleccionado = heredado || seleccionados?.has(nodo.codigo);
   return (
     <div className="arbol-nodo">
-      <button className="arbol-fila" style={{ paddingLeft: 12 + depth * 20 }} onClick={() => alternar(nodo.codigo)}>
-        <span className="arbol-caret">{abierto ? "▾" : "▸"}</span>
-        <span className="arbol-codigo">{nodo.codigo}</span>
-        <span className="arbol-label">{nodo.label}</span>
-        <span className="arbol-count">{contarTareas(nodo)}</span>
-      </button>
+      <div style={{ display: "flex", alignItems: "center" }}>
+        {modoSeleccion && (
+          <input type="checkbox" checked={!!seleccionado} disabled={heredado}
+            onChange={() => onToggleSeleccion(nodo.codigo)}
+            style={{ marginLeft: 12 + depth * 20, flexShrink: 0 }} />
+        )}
+        <button className="arbol-fila" style={{ paddingLeft: modoSeleccion ? 8 : 12 + depth * 20, flex: 1 }} onClick={() => alternar(nodo.codigo)}>
+          <span className="arbol-caret">{abierto ? "▾" : "▸"}</span>
+          <span className="arbol-codigo">{nodo.codigo}</span>
+          <span className="arbol-label">{nodo.label}</span>
+          <span className="arbol-count">{contarTareas(nodo)}</span>
+        </button>
+      </div>
       {abierto && (
         <div>
           {hijos.map(hijo => (
-            <NodoArbol key={hijo.codigo} nodo={hijo} depth={depth + 1} expandido={expandido} alternar={alternar} forzarAbierto={forzarAbierto} ESTADO_BADGE={ESTADO_BADGE} ESTADO_LABEL={ESTADO_LABEL} notify={notify} reload={reload} esGerente={esGerente} nombreUsuario={nombreUsuario} />
+            <NodoArbol key={hijo.codigo} nodo={hijo} depth={depth + 1} expandido={expandido} alternar={alternar} forzarAbierto={forzarAbierto} ESTADO_BADGE={ESTADO_BADGE} ESTADO_LABEL={ESTADO_LABEL} notify={notify} reload={reload} esGerente={esGerente} nombreUsuario={nombreUsuario} modoSeleccion={modoSeleccion} seleccionados={seleccionados} onToggleSeleccion={onToggleSeleccion} heredado={!!seleccionado} />
           ))}
           {nodo.tareas.length > 0 && (
             <div style={{ paddingLeft: 12 + (depth + 1) * 20 }}>
-              <TablaTareas tareas={nodo.tareas} ESTADO_BADGE={ESTADO_BADGE} ESTADO_LABEL={ESTADO_LABEL} notify={notify} reload={reload} esGerente={esGerente} nombreUsuario={nombreUsuario} />
+              <TablaTareas tareas={nodo.tareas} ESTADO_BADGE={ESTADO_BADGE} ESTADO_LABEL={ESTADO_LABEL} notify={notify} reload={reload} esGerente={esGerente} nombreUsuario={nombreUsuario} modoSeleccion={modoSeleccion} seleccionados={seleccionados} onToggleSeleccion={onToggleSeleccion} heredado={!!seleccionado} />
             </div>
           )}
         </div>
       )}
+    </div>
+  );
+}
+
+const AZUL_PL = [0, 34, 71]; // #002247, azul institucional de PL Offshore
+const DORADO_PL = [248, 188, 5]; // #F8BC05
+const GRIS_CLARO = [245, 247, 249];
+const CELESTE_CLARO = [223, 238, 250];
+const GRIS_TEXTO = [110, 120, 130];
+
+// Carga una imagen pública (ej: /pl-offshore-wordmark.png) y la devuelve como
+// data URL para incrustarla con doc.addImage. El PNG del logo tiene fondo
+// blanco opaco (no transparente), así que se usa siempre en sus colores
+// originales, sobre una tarjeta blanca cuando el fondo detrás es oscuro.
+function cargarImagenDataUrl(url) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      const canvas = document.createElement("canvas");
+      canvas.width = img.naturalWidth; canvas.height = img.naturalHeight;
+      canvas.getContext("2d").drawImage(img, 0, 0);
+      resolve({ dataUrl: canvas.toDataURL("image/png"), width: img.naturalWidth, height: img.naturalHeight });
+    };
+    img.onerror = reject;
+    img.src = url;
+  });
+}
+
+// Dibuja el logo (en sus colores originales) dentro de una tarjeta blanca
+// redondeada, del alto indicado, con esquina superior izquierda en (x, y).
+function dibujarLogoEnTarjeta(doc, logo, x, y, alto) {
+  const w = alto * (logo.width / logo.height);
+  const pad = alto * 0.18;
+  doc.setFillColor(255, 255, 255);
+  doc.roundedRect(x, y, w + pad * 2, alto + pad * 2, 2, 2, "F");
+  doc.addImage(logo.dataUrl, "PNG", x + pad, y + pad, w, alto);
+  return w + pad * 2;
+}
+
+// Dibuja el encabezado fijo (fondo azul + logo + título + buque) en la parte
+// superior de una página de contenido. Se suscribe al evento "addPage" de
+// jsPDF así se redibuja solo, tanto en los saltos de página manuales como en
+// los que genera autoTable al partir una tabla larga.
+function dibujarEncabezado(doc, buque, logo, pageWidth) {
+  doc.setFillColor(...AZUL_PL);
+  doc.rect(0, 0, pageWidth, 24, "F");
+  if (logo) dibujarLogoEnTarjeta(doc, logo, 10, 5, 10);
+  doc.setTextColor(255, 255, 255).setFontSize(11).setFont(undefined, "bold");
+  doc.text("REPORTE DE MANTENIMIENTO", pageWidth - 12, 11, { align: "right" });
+  doc.setFontSize(9).setFont(undefined, "normal");
+  doc.text(buque.nombre, pageWidth - 12, 17, { align: "right" });
+  doc.setTextColor(0);
+}
+
+const ESTILO_TABLA = {
+  headStyles: { fillColor: AZUL_PL, textColor: 255, fontStyle: "bold", fontSize: 9 },
+  bodyStyles: { fillColor: CELESTE_CLARO },
+  styles: { fontSize: 9, cellPadding: 3, textColor: [40, 45, 50] },
+};
+
+// Genera y descarga el PDF del reporte: carátula, resumen de horas actuales
+// de los equipos involucrados, y el historial de cada tarea seleccionada
+// (recortado según el modo elegido: última vez / desde una fecha / últimas N).
+async function generarReportePDF({ buque, tareas, horasMap, modo, valorModo }) {
+  const doc = new jsPDF();
+  const pageWidth = doc.internal.pageSize.getWidth();
+  const pageHeight = doc.internal.pageSize.getHeight();
+
+  let logo = null;
+  try { logo = await cargarImagenDataUrl("/pl-offshore-wordmark.png"); } catch { /* sin logo */ }
+
+  // Página 1: carátula, toda azul.
+  doc.setFillColor(...AZUL_PL);
+  doc.rect(0, 0, pageWidth, pageHeight, "F");
+  doc.setFillColor(...DORADO_PL);
+  doc.rect(0, pageHeight / 2 + 30, pageWidth, 1.5, "F");
+  if (logo) {
+    const logoAlto = 26;
+    const anchoTarjeta = logoAlto * (logo.width / logo.height) + logoAlto * 0.36;
+    dibujarLogoEnTarjeta(doc, logo, (pageWidth - anchoTarjeta) / 2, pageHeight / 2 - 55, logoAlto);
+  }
+  doc.setTextColor(255, 255, 255).setFontSize(24).setFont(undefined, "bold");
+  doc.text("REPORTE DE MANTENIMIENTO", pageWidth / 2, pageHeight / 2 + 20, { align: "center" });
+  doc.setFontSize(14).setFont(undefined, "normal");
+  doc.text(buque.nombre, pageWidth / 2, pageHeight / 2 + 30, { align: "center" });
+  doc.setFontSize(10);
+  doc.setTextColor(200, 210, 225);
+  doc.text(`Generado el ${fmtDate(today())}`, pageWidth / 2, pageHeight / 2 + 42, { align: "center" });
+  doc.setTextColor(0);
+
+  // A partir de aquí, toda página nueva (manual o de autoTable) lleva el
+  // encabezado fijo con la misma info de la carátula.
+  doc.internal.events.subscribe("addPage", () => dibujarEncabezado(doc, buque, logo, pageWidth));
+
+  doc.addPage();
+  doc.setTextColor(...AZUL_PL).setFontSize(15).setFont(undefined, "bold");
+  doc.text("Resumen de horas actuales", 14, 34);
+  doc.setTextColor(...GRIS_TEXTO).setFontSize(9).setFont(undefined, "normal");
+  doc.text("Equipos seleccionados que llevan horas de funcionamiento", 14, 40);
+  doc.setTextColor(0);
+  const equipoIds = [...new Set(tareas.map(t => t.equipo_id))];
+  const filasHoras = equipoIds
+    .filter(id => horasMap[id] != null)
+    .map(id => {
+      const t = tareas.find(x => x.equipo_id === id);
+      return [t?.mant_equipos?.nombre || id, `${horasMap[id]} hs`];
+    });
+  if (filasHoras.length) {
+    autoTable(doc, { startY: 45, head: [["Equipo", "Horas actuales"]], body: filasHoras, margin: { top: 26 }, ...ESTILO_TABLA });
+  } else {
+    doc.setFontSize(10).setFont(undefined, "normal").setTextColor(...GRIS_TEXTO);
+    doc.text("Ninguno de los equipos seleccionados lleva horas de funcionamiento.", 14, 50);
+    doc.setTextColor(0);
+  }
+
+  const ejecucionesTodas = tareas.length ? await api.getEjecucionesPorTareas(tareas.map(t => t.id)) : [];
+  const porTarea = {};
+  for (const e of ejecucionesTodas) (porTarea[e.tarea_id] ??= []).push(e);
+
+  doc.addPage();
+  doc.setTextColor(...AZUL_PL).setFontSize(15).setFont(undefined, "bold");
+  doc.text("Historial de cumplimiento", 14, 34);
+  doc.setTextColor(...GRIS_TEXTO).setFontSize(9).setFont(undefined, "normal");
+  doc.text(`${tareas.length} tarea${tareas.length !== 1 ? "s" : ""} incluida${tareas.length !== 1 ? "s" : ""}`, 14, 40);
+  doc.setTextColor(0);
+  let y = 50;
+  let equipoAnterior = null;
+
+  for (const t of tareas) {
+    if (t.equipo_id !== equipoAnterior) {
+      if (y > pageHeight - 40) { doc.addPage(); y = 32; }
+      else if (equipoAnterior !== null) y += 4;
+      doc.setFillColor(...GRIS_CLARO);
+      doc.rect(10, y - 7, pageWidth - 20, 11, "F");
+      doc.setFillColor(...DORADO_PL);
+      doc.rect(10, y - 7, 2, 11, "F");
+      doc.setTextColor(...AZUL_PL).setFontSize(14).setFont(undefined, "bold");
+      doc.text(t.mant_equipos?.nombre || "Equipo sin nombre", 16, y);
+      doc.setTextColor(0);
+      y += 12;
+      equipoAnterior = t.equipo_id;
+    }
+
+    let ejec = calcularCumplimientos(porTarea[t.id] || [], t);
+    if (modo === "ultima") ejec = ejec.slice(0, 1);
+    else if (modo === "desde") ejec = ejec.filter(e => e.fecha >= valorModo);
+    else if (modo === "ultimasN") ejec = ejec.slice(0, valorModo);
+
+    if (y > pageHeight - 30) { doc.addPage(); y = 32; }
+    doc.setFillColor(...AZUL_PL);
+    doc.rect(10, y - 5, pageWidth - 20, 8, "F");
+    doc.setFontSize(10).setFont(undefined, "bold").setTextColor(255, 255, 255);
+    doc.text(`${t.codigo || "s/código"} · ${t.descripcion}`, 14, y);
+    doc.setTextColor(0);
+    y += 8;
+
+    if (ejec.length === 0) {
+      doc.setFontSize(9).setFont(undefined, "normal").setTextColor(...GRIS_TEXTO);
+      doc.text("Sin cumplimientos registrados", 14, y);
+      doc.setTextColor(0);
+      y += 10;
+      continue;
+    }
+
+    const filas = ejec.map(e => [
+      fmtDate(e.fecha),
+      e.horas_equipo != null ? `${e.horas_equipo} hs` : "—",
+      !e.cumplimiento ? "—" : (e.cumplimiento.aTiempo
+        ? `A tiempo (${e.cumplimiento.valor} ${e.cumplimiento.unidad} antes)`
+        : `Vencida (${e.cumplimiento.valor} ${e.cumplimiento.unidad} después)`),
+    ]);
+    autoTable(doc, {
+      startY: y, head: [["Fecha", "Horas del equipo", "Cumplimiento"]], body: filas,
+      margin: { left: 14, right: 14, top: 26 },
+      ...ESTILO_TABLA,
+      didParseCell: (data) => {
+        if (data.section === "body" && data.column.index === 2) {
+          const val = data.cell.raw;
+          if (typeof val === "string" && val.startsWith("Vencida")) data.cell.styles.textColor = [180, 40, 40];
+          else if (typeof val === "string" && val.startsWith("A tiempo")) data.cell.styles.textColor = [30, 120, 90];
+        }
+      },
+    });
+    y = doc.lastAutoTable.finalY + 10;
+  }
+
+  const totalPaginas = doc.internal.getNumberOfPages();
+  for (let p = 2; p <= totalPaginas; p++) {
+    doc.setPage(p);
+    doc.setFontSize(8).setFont(undefined, "normal").setTextColor(...GRIS_TEXTO);
+    doc.text(`Página ${p - 1} de ${totalPaginas - 1}`, pageWidth / 2, pageHeight - 8, { align: "center" });
+    doc.setTextColor(0);
+  }
+
+  doc.save(`reporte-mantenimiento-${buque.nombre.replace(/\s+/g, "_")}-${today()}.pdf`);
+}
+
+//  MODAL: FILTRO DE HISTORIAL PARA EL REPORTE
+function ReporteFiltroModal({ cantidad, onClose, onConfirm }) {
+  const [modo, setModo] = useState("ultima");
+  const [fechaDesde, setFechaDesde] = useState(today());
+  const [cantidadN, setCantidadN] = useState(4);
+  const [generando, setGenerando] = useState(false);
+
+  const handleConfirm = async () => {
+    setGenerando(true);
+    try {
+      await onConfirm(modo, modo === "desde" ? fechaDesde : modo === "ultimasN" ? (parseInt(cantidadN) || 1) : null);
+      onClose();
+    } catch (e) { alert("Error: " + e.message); }
+    finally { setGenerando(false); }
+  };
+
+  return (
+    <div className="overlay" onClick={e => e.target === e.currentTarget && !generando && onClose()}>
+      <div className="modal">
+        <div className="mhdr">
+          <div className="mtitle">Generar reporte</div>
+          <button className="mclose" onClick={onClose} disabled={generando}>✕</button>
+        </div>
+        <div className="mbody">
+          <div className="info-box mb12" style={{ fontSize: 12 }}>{cantidad} tarea{cantidad !== 1 ? "s" : ""} seleccionada{cantidad !== 1 ? "s" : ""}</div>
+          <div className="form-section">¿Qué historial incluir?</div>
+          <label style={{ display: "flex", gap: 8, alignItems: "center", padding: "8px 0", cursor: "pointer" }}>
+            <input type="radio" name="modoReporte" checked={modo === "ultima"} onChange={() => setModo("ultima")} />
+            Solo la última vez que se realizó cada tarea
+          </label>
+          <label style={{ display: "flex", gap: 8, alignItems: "center", padding: "8px 0", cursor: "pointer" }}>
+            <input type="radio" name="modoReporte" checked={modo === "desde"} onChange={() => setModo("desde")} />
+            Desde una fecha en particular
+          </label>
+          {modo === "desde" && (
+            <div style={{ paddingLeft: 26, marginBottom: 8 }}>
+              <input type="date" value={fechaDesde} max={today()} onChange={e => setFechaDesde(e.target.value)} />
+            </div>
+          )}
+          <label style={{ display: "flex", gap: 8, alignItems: "center", padding: "8px 0", cursor: "pointer" }}>
+            <input type="radio" name="modoReporte" checked={modo === "ultimasN"} onChange={() => setModo("ultimasN")} />
+            Las últimas
+            <input type="number" min={1} value={cantidadN} disabled={modo !== "ultimasN"}
+              onChange={e => setCantidadN(e.target.value)} style={{ width: 60 }} />
+            veces que se realizó cada tarea
+          </label>
+        </div>
+        <div className="mftr">
+          <button className="btn btn-ghost" onClick={onClose} disabled={generando}>Cancelar</button>
+          <button className="btn btn-primary" onClick={handleConfirm} disabled={generando}>{generando ? "Generando..." : "⬇ Descargar PDF"}</button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -1512,6 +1804,9 @@ function PagePlan({ buque, notify, esGerente, nombreUsuario }) {
   const [filtroSector, setFiltroSector] = useState("");
   const [busqueda, setBusqueda] = useState("");
   const [expandido, setExpandido] = useState(() => new Set());
+  const [modoSeleccion, setModoSeleccion] = useState(false);
+  const [seleccionados, setSeleccionados] = useState(() => new Set());
+  const [modalReporte, setModalReporte] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -1554,6 +1849,29 @@ function PagePlan({ buque, notify, esGerente, nombreUsuario }) {
     return next;
   });
 
+  const onToggleSeleccion = (key) => setSeleccionados(prev => {
+    const next = new Set(prev);
+    if (next.has(key)) next.delete(key); else next.add(key);
+    return next;
+  });
+
+  const cancelarSeleccion = () => { setModoSeleccion(false); setSeleccionados(new Set()); };
+
+  const tareasSeleccionadas = useMemo(() => {
+    const out = [];
+    for (const nodo of gruposRaiz) recolectarSeleccionadas(nodo, false, seleccionados, out);
+    for (const [nombreEq, ts] of gruposOtras) {
+      const efectivo = seleccionados.has(`otras:${nombreEq}`);
+      for (const t of ts) if (efectivo || seleccionados.has(t.id)) out.push(t);
+    }
+    return out;
+  }, [gruposRaiz, gruposOtras, seleccionados]);
+
+  const handleGenerarReporte = async (modo, valorModo) => {
+    await generarReportePDF({ buque, tareas: tareasSeleccionadas, horasMap, modo, valorModo });
+    cancelarSeleccion();
+  };
+
   const ESTADO_BADGE = { vencida: "b-red", proxima: "b-amber", ok: "b-green", sin_datos: "b-gray" };
   const ESTADO_LABEL = { vencida: "Vencida", proxima: "Próxima", ok: "Al día", sin_datos: "Sin horas cargadas" };
 
@@ -1567,33 +1885,58 @@ function PagePlan({ buque, notify, esGerente, nombreUsuario }) {
         </select>
         {(busqueda || filtroSector) && <button className="btn btn-ghost btn-sm" onClick={() => { setBusqueda(""); setFiltroSector(""); }}>✕ Limpiar</button>}
         <span style={{ marginLeft: "auto", fontFamily: "var(--mono)", fontSize: 11, color: "var(--muted)" }}>{filtradas.length} tareas</span>
-        {esGerente && <button className="btn btn-ghost btn-sm" onClick={() => setModalEquipo(true)}>+ Equipo</button>}
+        {esGerente && <button className="btn btn-primary btn-sm" onClick={() => setModalEquipo(true)}>+ Equipo</button>}
         {esGerente && <button className="btn btn-primary btn-sm" onClick={() => setModalTarea(true)}>+ Tarea</button>}
       </div>
       {loading ? <div className="loading"><span className="spin">◌</span> Cargando...</div> :
         filtradas.length === 0 ? <div className="empty-state"><div style={{ fontSize: 28, marginBottom: 8 }}></div>Sin tareas</div> :
         <div className="card arbol" style={{ padding: 0 }}>
           {gruposRaiz.map(nodo => (
-            <NodoArbol key={nodo.codigo} nodo={nodo} depth={0} expandido={expandido} alternar={alternar} forzarAbierto={forzarAbierto} ESTADO_BADGE={ESTADO_BADGE} ESTADO_LABEL={ESTADO_LABEL} notify={notify} reload={load} esGerente={esGerente} nombreUsuario={nombreUsuario} />
+            <NodoArbol key={nodo.codigo} nodo={nodo} depth={0} expandido={expandido} alternar={alternar} forzarAbierto={forzarAbierto} ESTADO_BADGE={ESTADO_BADGE} ESTADO_LABEL={ESTADO_LABEL} notify={notify} reload={load} esGerente={esGerente} nombreUsuario={nombreUsuario} modoSeleccion={modoSeleccion} seleccionados={seleccionados} onToggleSeleccion={onToggleSeleccion} heredado={false} />
           ))}
           {gruposOtras.map(([nombreEq, ts]) => {
             const codigoOtras = `otras:${nombreEq}`;
             const abierto = forzarAbierto || expandido.has(codigoOtras);
+            const seleccionadoOtras = seleccionados.has(codigoOtras);
             return (
               <div className="arbol-nodo" key={codigoOtras}>
-                <button className="arbol-fila" style={{ paddingLeft: 12 }} onClick={() => alternar(codigoOtras)}>
-                  <span className="arbol-caret">{abierto ? "▾" : "▸"}</span>
-                  <span className="arbol-label">{nombreEq} — otras tareas sin código jerárquico</span>
-                  <span className="arbol-count">{ts.length}</span>
-                </button>
-                {abierto && <div style={{ paddingLeft: 32 }}><TablaTareas tareas={ts} ESTADO_BADGE={ESTADO_BADGE} ESTADO_LABEL={ESTADO_LABEL} notify={notify} reload={load} esGerente={esGerente} nombreUsuario={nombreUsuario} /></div>}
+                <div style={{ display: "flex", alignItems: "center" }}>
+                  {modoSeleccion && (
+                    <input type="checkbox" checked={seleccionadoOtras} style={{ marginLeft: 12 }}
+                      onChange={() => onToggleSeleccion(codigoOtras)} />
+                  )}
+                  <button className="arbol-fila" style={{ paddingLeft: modoSeleccion ? 8 : 12, flex: 1 }} onClick={() => alternar(codigoOtras)}>
+                    <span className="arbol-caret">{abierto ? "▾" : "▸"}</span>
+                    <span className="arbol-label">{nombreEq} — otras tareas sin código jerárquico</span>
+                    <span className="arbol-count">{ts.length}</span>
+                  </button>
+                </div>
+                {abierto && <div style={{ paddingLeft: 32 }}><TablaTareas tareas={ts} ESTADO_BADGE={ESTADO_BADGE} ESTADO_LABEL={ESTADO_LABEL} notify={notify} reload={load} esGerente={esGerente} nombreUsuario={nombreUsuario} modoSeleccion={modoSeleccion} seleccionados={seleccionados} onToggleSeleccion={onToggleSeleccion} heredado={seleccionadoOtras} /></div>}
               </div>
             );
           })}
         </div>
       }
+      {!loading && filtradas.length > 0 && (
+        <div className="flex-gap" style={{ marginTop: 12 }}>
+          {!modoSeleccion ? (
+            <button className="btn btn-primary btn-sm" onClick={() => setModoSeleccion(true)}>⬇ Descargar reporte</button>
+          ) : (
+            <>
+              <button className="btn btn-ghost btn-sm" onClick={cancelarSeleccion}>Cancelar selección</button>
+              <button className="btn btn-primary btn-sm" disabled={tareasSeleccionadas.length === 0} onClick={() => setModalReporte(true)}>
+                Generar reporte ({tareasSeleccionadas.length} tarea{tareasSeleccionadas.length !== 1 ? "s" : ""})
+              </button>
+            </>
+          )}
+        </div>
+      )}
       {modalTarea && <TareaModal buqueId={buque.id} equipos={equipos} esGerente={esGerente} onClose={() => setModalTarea(false)} onSave={() => { setModalTarea(false); notify("Tarea creada", "success"); load(); }} />}
       {modalEquipo && <EquipoModal buqueId={buque.id} esGerente={esGerente} onClose={() => setModalEquipo(false)} onSave={() => { setModalEquipo(false); notify("Equipo creado", "success"); load(); }} />}
+      {modalReporte && (
+        <ReporteFiltroModal cantidad={tareasSeleccionadas.length} onClose={() => setModalReporte(false)}
+          onConfirm={async (modo, valorModo) => { await handleGenerarReporte(modo, valorModo); notify("Reporte descargado", "success"); }} />
+      )}
     </div>
   );
 }
