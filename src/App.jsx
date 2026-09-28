@@ -1,8 +1,10 @@
 import { useState, useEffect, useCallback, useMemo } from "react";
+import { createPortal } from "react-dom";
 import { supabase } from "./lib/supabase";
 import { TAXONOMIA_TECNICA } from "./lib/taxonomiaTecnica";
 
-const USUARIO = "Jefe de Máquinas";
+const NOMBRE_TRIPULACION = "Jefe de Máquinas";
+const NOMBRE_GERENCIA = "Gerente Técnico";
 
 const CSS = `
 @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
@@ -478,6 +480,32 @@ const api = {
     const { error } = await supabase.from("mant_ejecuciones").insert([ej]);
     if (error) throw error;
   },
+  async getHorasEnFecha(buqueId, equipoId, fecha) {
+    // Puede haber más de un registro cargado el mismo día (correcciones); se toma
+    // el más reciente, igual que getUltimasHoras.
+    const { data, error } = await supabase
+      .from("mant_registros_horas")
+      .select("horas")
+      .eq("buque_id", buqueId)
+      .eq("equipo_id", equipoId)
+      .eq("fecha", fecha)
+      .order("created_at", { ascending: false })
+      .limit(1);
+    if (error) throw error;
+    return data && data.length ? data[0].horas : null;
+  },
+  async getUltimoRegistro(buqueId, equipoId, antesDe) {
+    // antesDe: si se pasa, toma el último registro estrictamente anterior a esa
+    // fecha, para que sirva de base estable aunque el propio día se corrija.
+    let q = supabase.from("mant_registros_horas").select("horas, fecha").eq("buque_id", buqueId).eq("equipo_id", equipoId);
+    if (antesDe) q = q.lt("fecha", antesDe);
+    const { data, error } = await q
+      .order("fecha", { ascending: false })
+      .order("created_at", { ascending: false })
+      .limit(1);
+    if (error) throw error;
+    return data && data.length ? data[0] : null;
+  },
   async getCorrectivos(buqueId) {
     const { data, error } = await supabase
       .from("mant_correctivos")
@@ -491,8 +519,8 @@ const api = {
   async crearEquipo(eq) { const { data, error } = await supabase.from("mant_equipos").insert([eq]).select().single(); if (error) throw error; return data; },
   async crearTarea(t) { const { data, error } = await supabase.from("mant_tareas").insert([t]).select().single(); if (error) throw error; return data; },
   async actualizarTarea(id, c) { const { error } = await supabase.from("mant_tareas").update(c).eq("id", id); if (error) throw error; },
-  async subirAdjunto(file, ejecucionId) {
-    const path = `riesgo/${ejecucionId}/${Date.now()}_${file.name}`;
+  async subirAdjunto(file, ejecucionId, carpeta = "riesgo") {
+    const path = `${carpeta}/${ejecucionId}/${Date.now()}_${file.name}`;
     const { error } = await supabase.storage.from("mantenimiento").upload(path, file, { upsert: true });
     if (error) throw error;
     const { data } = supabase.storage.from("mantenimiento").getPublicUrl(path);
@@ -607,7 +635,151 @@ function EjecucionModal({ tarea, buqueId, horasActuales, horasVencimiento, onClo
   );
 }
 
-//  MODAL: CORRECTIVO 
+//  MODAL: CUMPLIR TAREA (desde el árbol del Plan completo)
+function CumplirTareaModal({ tarea, esGerente, nombreUsuario, onClose, onSave }) {
+  const buqueId = tarea.mant_equipos?.buque_id;
+  const [fecha, setFecha] = useState(today());
+  const [taller, setTaller] = useState("");
+  const [remito, setRemito] = useState("");
+  const [observaciones, setObservaciones] = useState("");
+  const [archivo, setArchivo] = useState(null);
+  const [horas, setHoras] = useState(null);
+  const [horasLoading, setHorasLoading] = useState(true);
+  const [ultimo, setUltimo] = useState(null);
+  const [horasInput, setHorasInput] = useState("");
+  const [editandoHoras, setEditandoHoras] = useState(false);
+  const [cargandoHoras, setCargandoHoras] = useState(false);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    let vivo = true;
+    setHorasLoading(true);
+    setHorasInput("");
+    setEditandoHoras(false);
+    Promise.all([
+      api.getHorasEnFecha(buqueId, tarea.equipo_id, fecha),
+      api.getUltimoRegistro(buqueId, tarea.equipo_id, fecha),
+    ]).then(([h, u]) => { if (vivo) { setHoras(h); setUltimo(u); setHorasLoading(false); } })
+      .catch(() => { if (vivo) { setHoras(null); setUltimo(null); setHorasLoading(false); } });
+    return () => { vivo = false; };
+  }, [fecha]);
+
+  const sinHoras = !horasLoading && horas === null;
+  const puedeCargarHoras = ultimo ? fecha >= ultimo.fecha : esGerente;
+
+  const abrirEdicionHoras = () => {
+    setHorasInput(!sinHoras ? String(Math.max(0, horas - (ultimo ? ultimo.horas : 0))) : "");
+    setEditandoHoras(true);
+  };
+
+  const confirmarHoras = async () => {
+    if (cargandoHoras) return;
+    if (horasInput === "") { setEditandoHoras(false); return; }
+    const ingresado = parseInt(horasInput);
+    if (isNaN(ingresado) || ingresado < 0) return alert("Ingresá un valor de horas válido");
+    let horasFinal;
+    if (!ultimo) {
+      horasFinal = ingresado;
+    } else {
+      const dias = Math.max(1, Math.round((new Date(fecha) - new Date(ultimo.fecha)) / 86400000));
+      const maxPermitido = HORAS_MAX_POR_DIA * dias;
+      if (ingresado > maxPermitido) return alert(`Supera el máximo de ${HORAS_MAX_POR_DIA} hs de funcionamiento por día.\n\nTope permitido: ${maxPermitido} hs (${dias} día/s desde el ${fmtDate(ultimo.fecha)}).`);
+      horasFinal = ultimo.horas + ingresado;
+    }
+    setCargandoHoras(true);
+    try {
+      await api.registrarHoras([{ buque_id: buqueId, equipo_id: tarea.equipo_id, horas: horasFinal, fecha, registrado_por: nombreUsuario }]);
+      setHoras(horasFinal);
+      setHorasInput("");
+      setEditandoHoras(false);
+    } catch (e) { alert("Error: " + e.message); }
+    finally { setCargandoHoras(false); }
+  };
+
+  const handleSave = async () => {
+    if (!taller) return alert("Completá el taller interviniente");
+    if (fecha > today()) return alert("No se puede registrar el cumplimiento con fecha futura. Elegí hoy o una fecha anterior.");
+    if (horasLoading || sinHoras) return;
+    setSaving(true);
+    try {
+      let adjunto_remito_url = "";
+      if (archivo) {
+        const tempId = `temp_${Date.now()}`;
+        adjunto_remito_url = await api.subirAdjunto(archivo, tempId, "remitos");
+      }
+      await api.registrarEjecucion({
+        tarea_id: tarea.id, buque_id: buqueId, fecha,
+        horas_equipo: horas, realizado_por: taller, taller_interviniente: taller,
+        numero_remito: remito, observaciones, adjunto_remito_url,
+      });
+      await api.actualizarTarea(tarea.id, { ultima_ejecucion_hs: horas, ultima_ejecucion_fecha: fecha });
+      onSave();
+    } catch (e) { alert("Error: " + e.message); }
+    finally { setSaving(false); }
+  };
+
+  return (
+    <div className="overlay" onClick={e => e.target === e.currentTarget && onClose()}>
+      <div className="modal">
+        <div className="mhdr">
+          <div className="mtitle">Cumplir tarea</div>
+          <button className="mclose" onClick={onClose}>✕</button>
+        </div>
+        <div className="mbody">
+          <div className="info-box mb12" style={{ fontSize: 12 }}>
+            <strong>{tarea.descripcion}</strong><br />
+            <span style={{ color: "var(--muted)", fontSize: 11 }}>{tarea.mant_equipos?.nombre} · Código: {tarea.codigo || "—"}</span>
+          </div>
+          <div className="form-grid">
+            <FG label="Fecha de realización *">
+              <input type="date" value={fecha} max={today()} onChange={e => setFecha(e.target.value)} />
+            </FG>
+            <FG label="Horas del equipo al momento del mantenimiento" full>
+              {horasLoading ? (
+                <input disabled value="Buscando..." />
+              ) : editandoHoras ? (
+                <div className={`flex-gap ${sinHoras ? "info-box danger" : ""}`} style={{ fontSize: 11 }}>
+                  <span>{!ultimo ? "Horas del equipo:" : "Horas trabajadas ese día:"}</span>
+                  <input type="number" min={0} autoFocus disabled={cargandoHoras}
+                    value={horasInput} onChange={e => setHorasInput(e.target.value)}
+                    onKeyDown={e => e.key === "Enter" && confirmarHoras()}
+                    onBlur={confirmarHoras}
+                    style={{ maxWidth: 120 }} />
+                </div>
+              ) : !sinHoras ? (
+                <input readOnly value={`${horas} hs · click para corregir`}
+                  style={{ cursor: "pointer" }} onClick={abrirEdicionHoras} />
+              ) : !puedeCargarHoras ? (
+                <div className="info-box danger" style={{ fontSize: 11 }}>
+                  No hay horas cargadas de {tarea.mant_equipos?.nombre} para el {fmtDate(fecha)}.{" "}
+                  {!ultimo
+                    ? "La carga inicial de un equipo sin datos previos solo la puede hacer la gerencia."
+                    : `No se pueden cargar horas para una fecha anterior al último registro (${fmtDate(ultimo.fecha)}).`}
+                </div>
+              ) : (
+                <div className="info-box danger" style={{ fontSize: 11, cursor: "pointer", textDecoration: "underline" }} onClick={abrirEdicionHoras}>
+                  No hay horas cargadas de {tarea.mant_equipos?.nombre} para el {fmtDate(fecha)}. Click para cargar las horas {!ultimo ? "iniciales" : "trabajadas ese día"}.
+                </div>
+              )}
+            </FG>
+            <FG label="Taller interviniente *"><input value={taller} onChange={e => setTaller(e.target.value)} placeholder="Ej: Taller Naval SRL" /></FG>
+            <FG label="N° de remito"><input value={remito} onChange={e => setRemito(e.target.value)} placeholder="Ej: 0001-00012345" /></FG>
+          </div>
+          <FG label="Observaciones" full><textarea value={observaciones} onChange={e => setObservaciones(e.target.value)} placeholder="Notas del trabajo realizado..." /></FG>
+          <FG label="📎 Adjuntar remito" full>
+            <input type="file" accept=".pdf,.jpg,.png" onChange={e => setArchivo(e.target.files[0])} style={{ fontSize: 12, padding: "6px 0" }} />
+          </FG>
+        </div>
+        <div className="mftr">
+          <button className="btn btn-ghost" onClick={onClose}>Cancelar</button>
+          <button className="btn btn-primary" onClick={handleSave} disabled={saving || horasLoading || sinHoras}>{saving ? "Guardando..." : "Dar por cumplida"}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+//  MODAL: CORRECTIVO
 function CorrectivoModal({ buqueId, equipos, correctivo, onClose, onSave }) {
   const [form, setForm] = useState({
     buque_id: buqueId, equipo_id: "", titulo: "", descripcion: "",
@@ -673,12 +845,13 @@ function CorrectivoModal({ buqueId, equipos, correctivo, onClose, onSave }) {
 }
 
 //  MODAL: TAREA 
-function TareaModal({ buqueId, equipos, onClose, onSave }) {
+function TareaModal({ buqueId, equipos, esGerente, onClose, onSave }) {
   const [form, setForm] = useState({ equipo_id: "", codigo: "", descripcion: "", tipo_frecuencia: "horas", frecuencia_hs: "", frecuencia_texto: "", es_critica: false });
   const [saving, setSaving] = useState(false);
   const set = (k, v) => setForm(f => ({ ...f, [k]: v }));
 
   const handleSave = async () => {
+    if (!esGerente) return alert("Solo la gerencia puede agregar tareas.");
     if (!form.equipo_id || !form.descripcion) return alert("Completá equipo y descripción");
     setSaving(true);
     try {
@@ -727,12 +900,13 @@ function TareaModal({ buqueId, equipos, onClose, onSave }) {
 }
 
 //  MODAL: EQUIPO 
-function EquipoModal({ buqueId, onClose, onSave }) {
+function EquipoModal({ buqueId, esGerente, onClose, onSave }) {
   const [form, setForm] = useState({ buque_id: buqueId, codigo: "", nombre: "", sistema: "", sector: "MAQ", marca: "", modelo: "", nro_serie: "", activo: true });
   const [saving, setSaving] = useState(false);
   const set = (k, v) => setForm(f => ({ ...f, [k]: v }));
 
   const handleSave = async () => {
+    if (!esGerente) return alert("Solo la gerencia puede agregar equipos.");
     if (!form.nombre) return alert("El nombre es obligatorio");
     setSaving(true);
     try { await api.crearEquipo(form); onSave(); }
@@ -884,7 +1058,7 @@ function PageDashboard({ buque, notify }) {
 //  PAGE: CARGA DE HORAS 
 const HORAS_MAX_POR_DIA = 24;
 
-function PageHoras({ buque, notify, esGerente }) {
+function PageHoras({ buque, notify, esGerente, nombreUsuario }) {
   const [equipos, setEquipos] = useState([]);
   const [valores, setValores] = useState({});
   const [registros, setRegistros] = useState([]);
@@ -944,7 +1118,7 @@ function PageHoras({ buque, notify, esGerente }) {
 
     setGuardandoId(eq.id);
     try {
-      await api.registrarHoras([{ buque_id: buque.id, equipo_id: eq.id, horas, fecha, registrado_por: USUARIO }]);
+      await api.registrarHoras([{ buque_id: buque.id, equipo_id: eq.id, horas, fecha, registrado_por: nombreUsuario }]);
       notify(`${eq.nombre}: horas registradas`, "success");
       load();
     } catch (e) { notify("Error: " + e.message, "error"); }
@@ -1151,7 +1325,8 @@ function contarTareas(nodo) {
   return total;
 }
 
-function FilaTarea({ t, ESTADO_BADGE, ESTADO_LABEL }) {
+function FilaTarea({ t, ESTADO_BADGE, ESTADO_LABEL, notify, reload, esGerente, nombreUsuario }) {
+  const [modalCumplir, setModalCumplir] = useState(false);
   return (
     <tr>
       <td className="text-mono" style={{ fontSize: 10, color: "var(--muted)" }}>{t.codigo || "—"}</td>
@@ -1166,22 +1341,28 @@ function FilaTarea({ t, ESTADO_BADGE, ESTADO_LABEL }) {
       </td>
       <td>{t.tipo_frecuencia === "horas" ? <span className={`badge ${ESTADO_BADGE[t.estado]}`}>{ESTADO_LABEL[t.estado]}</span> : <span style={{ color: "var(--muted2)", fontSize: 11 }}>Por fecha</span>}</td>
       <td>{t.es_critica ? <span className="badge b-red">Sí</span> : <span style={{ color: "var(--muted2)", fontSize: 11 }}>—</span>}</td>
+      <td><button className="btn btn-success btn-sm" onClick={() => setModalCumplir(true)}>✓ Cumplir</button></td>
+      {modalCumplir && createPortal(
+        <CumplirTareaModal tarea={t} esGerente={esGerente} nombreUsuario={nombreUsuario} onClose={() => setModalCumplir(false)}
+          onSave={() => { setModalCumplir(false); notify?.("Tarea dada por cumplida", "success"); reload?.(); }} />,
+        document.body
+      )}
     </tr>
   );
 }
 
-function TablaTareas({ tareas, ESTADO_BADGE, ESTADO_LABEL }) {
+function TablaTareas({ tareas, ESTADO_BADGE, ESTADO_LABEL, notify, reload, esGerente, nombreUsuario }) {
   return (
     <div className="table-wrap">
       <table>
-        <thead><tr><th>Código</th><th>Descripción</th><th>Frecuencia</th><th>Horas actuales</th><th>Restante</th><th>Estado</th><th>Crítica</th></tr></thead>
-        <tbody>{tareas.map(t => <FilaTarea key={t.id} t={t} ESTADO_BADGE={ESTADO_BADGE} ESTADO_LABEL={ESTADO_LABEL} />)}</tbody>
+        <thead><tr><th>Código</th><th>Descripción</th><th>Frecuencia</th><th>Horas actuales</th><th>Restante</th><th>Estado</th><th>Crítica</th><th></th></tr></thead>
+        <tbody>{tareas.map(t => <FilaTarea key={t.id} t={t} ESTADO_BADGE={ESTADO_BADGE} ESTADO_LABEL={ESTADO_LABEL} notify={notify} reload={reload} esGerente={esGerente} nombreUsuario={nombreUsuario} />)}</tbody>
       </table>
     </div>
   );
 }
 
-function NodoArbol({ nodo, depth, expandido, alternar, forzarAbierto, ESTADO_BADGE, ESTADO_LABEL }) {
+function NodoArbol({ nodo, depth, expandido, alternar, forzarAbierto, ESTADO_BADGE, ESTADO_LABEL, notify, reload, esGerente, nombreUsuario }) {
   const abierto = forzarAbierto || expandido.has(nodo.codigo);
   const hijos = [...nodo.children.values()].sort((a, b) => compararCodigos(a.codigo, b.codigo));
   return (
@@ -1195,11 +1376,11 @@ function NodoArbol({ nodo, depth, expandido, alternar, forzarAbierto, ESTADO_BAD
       {abierto && (
         <div>
           {hijos.map(hijo => (
-            <NodoArbol key={hijo.codigo} nodo={hijo} depth={depth + 1} expandido={expandido} alternar={alternar} forzarAbierto={forzarAbierto} ESTADO_BADGE={ESTADO_BADGE} ESTADO_LABEL={ESTADO_LABEL} />
+            <NodoArbol key={hijo.codigo} nodo={hijo} depth={depth + 1} expandido={expandido} alternar={alternar} forzarAbierto={forzarAbierto} ESTADO_BADGE={ESTADO_BADGE} ESTADO_LABEL={ESTADO_LABEL} notify={notify} reload={reload} esGerente={esGerente} nombreUsuario={nombreUsuario} />
           ))}
           {nodo.tareas.length > 0 && (
             <div style={{ paddingLeft: 12 + (depth + 1) * 20 }}>
-              <TablaTareas tareas={nodo.tareas} ESTADO_BADGE={ESTADO_BADGE} ESTADO_LABEL={ESTADO_LABEL} />
+              <TablaTareas tareas={nodo.tareas} ESTADO_BADGE={ESTADO_BADGE} ESTADO_LABEL={ESTADO_LABEL} notify={notify} reload={reload} esGerente={esGerente} nombreUsuario={nombreUsuario} />
             </div>
           )}
         </div>
@@ -1208,7 +1389,7 @@ function NodoArbol({ nodo, depth, expandido, alternar, forzarAbierto, ESTADO_BAD
   );
 }
 
-function PagePlan({ buque, notify }) {
+function PagePlan({ buque, notify, esGerente, nombreUsuario }) {
   const [tareas, setTareas] = useState([]);
   const [equipos, setEquipos] = useState([]);
   const [horasMap, setHorasMap] = useState({});
@@ -1273,14 +1454,14 @@ function PagePlan({ buque, notify }) {
         </select>
         {(busqueda || filtroSector) && <button className="btn btn-ghost btn-sm" onClick={() => { setBusqueda(""); setFiltroSector(""); }}>✕ Limpiar</button>}
         <span style={{ marginLeft: "auto", fontFamily: "var(--mono)", fontSize: 11, color: "var(--muted)" }}>{filtradas.length} tareas</span>
-        <button className="btn btn-ghost btn-sm" onClick={() => setModalEquipo(true)}>+ Equipo</button>
-        <button className="btn btn-primary btn-sm" onClick={() => setModalTarea(true)}>+ Tarea</button>
+        {esGerente && <button className="btn btn-ghost btn-sm" onClick={() => setModalEquipo(true)}>+ Equipo</button>}
+        {esGerente && <button className="btn btn-primary btn-sm" onClick={() => setModalTarea(true)}>+ Tarea</button>}
       </div>
       {loading ? <div className="loading"><span className="spin">◌</span> Cargando...</div> :
         filtradas.length === 0 ? <div className="empty-state"><div style={{ fontSize: 28, marginBottom: 8 }}></div>Sin tareas</div> :
         <div className="card arbol" style={{ padding: 0 }}>
           {gruposRaiz.map(nodo => (
-            <NodoArbol key={nodo.codigo} nodo={nodo} depth={0} expandido={expandido} alternar={alternar} forzarAbierto={forzarAbierto} ESTADO_BADGE={ESTADO_BADGE} ESTADO_LABEL={ESTADO_LABEL} />
+            <NodoArbol key={nodo.codigo} nodo={nodo} depth={0} expandido={expandido} alternar={alternar} forzarAbierto={forzarAbierto} ESTADO_BADGE={ESTADO_BADGE} ESTADO_LABEL={ESTADO_LABEL} notify={notify} reload={load} esGerente={esGerente} nombreUsuario={nombreUsuario} />
           ))}
           {gruposOtras.map(([nombreEq, ts]) => {
             const codigoOtras = `otras:${nombreEq}`;
@@ -1292,14 +1473,14 @@ function PagePlan({ buque, notify }) {
                   <span className="arbol-label">{nombreEq} — otras tareas sin código jerárquico</span>
                   <span className="arbol-count">{ts.length}</span>
                 </button>
-                {abierto && <div style={{ paddingLeft: 32 }}><TablaTareas tareas={ts} ESTADO_BADGE={ESTADO_BADGE} ESTADO_LABEL={ESTADO_LABEL} /></div>}
+                {abierto && <div style={{ paddingLeft: 32 }}><TablaTareas tareas={ts} ESTADO_BADGE={ESTADO_BADGE} ESTADO_LABEL={ESTADO_LABEL} notify={notify} reload={load} esGerente={esGerente} nombreUsuario={nombreUsuario} /></div>}
               </div>
             );
           })}
         </div>
       }
-      {modalTarea && <TareaModal buqueId={buque.id} equipos={equipos} onClose={() => setModalTarea(false)} onSave={() => { setModalTarea(false); notify("Tarea creada", "success"); load(); }} />}
-      {modalEquipo && <EquipoModal buqueId={buque.id} onClose={() => setModalEquipo(false)} onSave={() => { setModalEquipo(false); notify("Equipo creado", "success"); load(); }} />}
+      {modalTarea && <TareaModal buqueId={buque.id} equipos={equipos} esGerente={esGerente} onClose={() => setModalTarea(false)} onSave={() => { setModalTarea(false); notify("Tarea creada", "success"); load(); }} />}
+      {modalEquipo && <EquipoModal buqueId={buque.id} esGerente={esGerente} onClose={() => setModalEquipo(false)} onSave={() => { setModalEquipo(false); notify("Equipo creado", "success"); load(); }} />}
     </div>
   );
 }
@@ -1558,6 +1739,8 @@ function MantenimientoApp({ email }) {
   // Las cuentas de buque (ACCESO_POR_BUQUE) son tripulación; cualquier otra cuenta
   // (gerencia) tiene permiso para cargar la hora inicial de un equipo sin datos previos.
   const esGerente = !ACCESO_POR_BUQUE[email?.toLowerCase()];
+  const nombreUsuario = esGerente ? NOMBRE_GERENCIA : NOMBRE_TRIPULACION;
+  const inicialesUsuario = esGerente ? "GT" : "JM";
 
   useEffect(() => {
     api.getBuques().then(data => {
@@ -1631,8 +1814,8 @@ function MantenimientoApp({ email }) {
           <span style={{ color: "rgba(255,255,255,.86)", display: "block" }}><Ico d={ICONS.bell} /></span>
           <span style={{ color: "rgba(255,255,255,.86)", display: "block" }}><Ico d={ICONS.help} /></span>
           <span className="appbar-div" />
-          <span className="appbar-avatar">JM</span>
-          <span className="appbar-user">{USUARIO}</span>
+          <span className="appbar-avatar">{inicialesUsuario}</span>
+          <span className="appbar-user">{nombreUsuario}</span>
         </div>
       </header>
 
@@ -1725,8 +1908,8 @@ function MantenimientoApp({ email }) {
               ? <div className="empty-state">Seleccioná un buque en el menú para ver su plan de mantenimiento.</div>
               : <>
                   {page === "dashboard" && <PageDashboard buque={buqueSeleccionado} notify={notify} />}
-                  {page === "horas" && <PageHoras buque={buqueSeleccionado} notify={notify} esGerente={esGerente} />}
-                  {page === "plan" && <PagePlan buque={buqueSeleccionado} notify={notify} />}
+                  {page === "horas" && <PageHoras buque={buqueSeleccionado} notify={notify} esGerente={esGerente} nombreUsuario={nombreUsuario} />}
+                  {page === "plan" && <PagePlan buque={buqueSeleccionado} notify={notify} esGerente={esGerente} nombreUsuario={nombreUsuario} />}
                   {page === "correctivos" && <PageCorrectivos buque={buqueSeleccionado} notify={notify} />}
                   {page === "historial" && <PageHistorial buque={buqueSeleccionado} />}
                   {page === "kpis" && <PageKPIs buque={buqueSeleccionado} />}
