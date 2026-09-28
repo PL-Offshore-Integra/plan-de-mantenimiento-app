@@ -379,6 +379,26 @@ const fmtDate = d => d ? new Date(d + "T00:00:00").toLocaleDateString("es-AR") :
 const today = () => new Date().toISOString().split("T")[0];
 const addDays = (date, days) => { const d = new Date(date); d.setDate(d.getDate() + days); return d.toISOString().split("T")[0]; };
 
+// Convierte frecuencias por tiempo en texto libre (ej: "6 meses", "anual") a
+// días aproximados, para poder proyectar el vencimiento de tareas por fecha.
+function parseFrecuenciaDias(texto) {
+  if (!texto) return null;
+  const t = texto.toLowerCase();
+  if (/semanal/.test(t)) return 7;
+  if (/mensual/.test(t)) return 30;
+  if (/semestral/.test(t)) return 182;
+  if (/anual/.test(t)) return 365;
+  const m = t.match(/(\d+)\s*(años?|mes(?:es)?|semanas?|d[ií]as?)/);
+  if (!m) return null;
+  const n = parseInt(m[1]);
+  const unidad = m[2];
+  if (unidad.startsWith("año")) return n * 365;
+  if (unidad.startsWith("mes")) return n * 30;
+  if (unidad.startsWith("semana")) return n * 7;
+  if (unidad.startsWith("d")) return n;
+  return null;
+}
+
 // Equipos habilitados para carga diaria de horas de funcionamiento.
 // Nombres tal como figuran en el PMS (NUEVO_PLAN_DE_MANTENIMIENTO_REV3.xlsx, hoja "Hoja1").
 // El orden de esta lista es el orden en que se muestran en la pantalla "Carga de horas".
@@ -479,6 +499,15 @@ const api = {
   async registrarEjecucion(ej) {
     const { error } = await supabase.from("mant_ejecuciones").insert([ej]);
     if (error) throw error;
+  },
+  async getEjecucionesPorTarea(tareaId) {
+    const { data, error } = await supabase
+      .from("mant_ejecuciones")
+      .select("fecha, horas_equipo")
+      .eq("tarea_id", tareaId)
+      .order("fecha", { ascending: false });
+    if (error) throw error;
+    return data || [];
   },
   async getHorasEnFecha(buqueId, equipoId, fecha) {
     // Puede haber más de un registro cargado el mismo día (correcciones); se toma
@@ -773,6 +802,82 @@ function CumplirTareaModal({ tarea, esGerente, nombreUsuario, onClose, onSave })
         <div className="mftr">
           <button className="btn btn-ghost" onClick={onClose}>Cancelar</button>
           <button className="btn btn-primary" onClick={handleSave} disabled={saving || horasLoading || sinHoras}>{saving ? "Guardando..." : "Dar por cumplida"}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+//  MODAL: HISTORIAL DE CUMPLIMIENTO DE UNA TAREA
+function HistorialTareaModal({ tarea, onClose }) {
+  const [ejecuciones, setEjecuciones] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    api.getEjecucionesPorTarea(tarea.id).then(d => { setEjecuciones(d); setLoading(false); });
+  }, [tarea.id]);
+
+  // Cada cumplimiento se compara contra el anterior para ver si se cumplió a
+  // tiempo: por horas, contra horas_equipo + frecuencia_hs; por fecha, contra
+  // fecha + frecuencia (interpretada en días). El primero de la lista no tiene
+  // referencia previa, así que no se puede evaluar.
+  const ascendente = [...ejecuciones].sort((a, b) => a.fecha < b.fecha ? -1 : a.fecha > b.fecha ? 1 : 0);
+  const diasFrecuencia = tarea.tipo_frecuencia !== "horas" ? parseFrecuenciaDias(tarea.frecuencia_texto) : null;
+  const conCumplimiento = ascendente.map((e, i) => {
+    if (i === 0) return { ...e, cumplimiento: null };
+    const prev = ascendente[i - 1];
+    if (tarea.tipo_frecuencia === "horas" && tarea.frecuencia_hs && e.horas_equipo != null && prev.horas_equipo != null) {
+      const diff = (prev.horas_equipo + tarea.frecuencia_hs) - e.horas_equipo;
+      return { ...e, cumplimiento: { aTiempo: diff >= 0, valor: Math.abs(diff), unidad: "hs" } };
+    }
+    if (tarea.tipo_frecuencia !== "horas" && diasFrecuencia) {
+      const diffDias = Math.round((new Date(addDays(prev.fecha, diasFrecuencia)) - new Date(e.fecha)) / 86400000);
+      return { ...e, cumplimiento: { aTiempo: diffDias >= 0, valor: Math.abs(diffDias), unidad: "días" } };
+    }
+    return { ...e, cumplimiento: null };
+  });
+  const paraMostrar = [...conCumplimiento].reverse();
+
+  return (
+    <div className="overlay" onClick={e => e.target === e.currentTarget && onClose()}>
+      <div className="modal">
+        <div className="mhdr">
+          <div className="mtitle">Historial de cumplimiento</div>
+          <button className="mclose" onClick={onClose}>✕</button>
+        </div>
+        <div className="mbody">
+          <div className="info-box mb12" style={{ fontSize: 12 }}>
+            <strong>{tarea.descripcion}</strong><br />
+            <span style={{ color: "var(--muted)", fontSize: 11 }}>{tarea.mant_equipos?.nombre} · Código: {tarea.codigo || "—"}</span>
+          </div>
+          {loading ? <div className="loading"><span className="spin">◌</span> Cargando...</div> :
+            paraMostrar.length === 0 ? <div className="empty-state"><div style={{ fontSize: 28, marginBottom: 8 }}></div>Sin cumplimientos registrados</div> :
+            <div className="table-wrap">
+              <table>
+                <thead><tr><th>Fecha</th><th>Horas del equipo</th><th>Cumplimiento</th></tr></thead>
+                <tbody>
+                  {paraMostrar.map((e, i) => (
+                    <tr key={i}>
+                      <td className="text-mono" style={{ fontSize: 11 }}>{fmtDate(e.fecha)}</td>
+                      <td className="text-mono" style={{ fontSize: 11, color: "var(--blue)" }}>{e.horas_equipo != null ? `${e.horas_equipo} hs` : "—"}</td>
+                      <td>
+                        {!e.cumplimiento ? <span style={{ color: "var(--muted2)", fontSize: 11 }}>—</span> : (
+                          <span className={`badge ${e.cumplimiento.aTiempo ? "b-green" : "b-red"}`}>
+                            {e.cumplimiento.aTiempo
+                              ? `A tiempo (${e.cumplimiento.valor} ${e.cumplimiento.unidad} antes)`
+                              : `Vencida (${e.cumplimiento.valor} ${e.cumplimiento.unidad} después)`}
+                          </span>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          }
+        </div>
+        <div className="mftr">
+          <button className="btn btn-ghost" onClick={onClose}>Cerrar</button>
         </div>
       </div>
     </div>
@@ -1327,6 +1432,7 @@ function contarTareas(nodo) {
 
 function FilaTarea({ t, ESTADO_BADGE, ESTADO_LABEL, notify, reload, esGerente, nombreUsuario }) {
   const [modalCumplir, setModalCumplir] = useState(false);
+  const [modalHistorial, setModalHistorial] = useState(false);
   return (
     <tr>
       <td className="text-mono" style={{ fontSize: 10, color: "var(--muted)" }}>{t.codigo || "—"}</td>
@@ -1341,10 +1447,17 @@ function FilaTarea({ t, ESTADO_BADGE, ESTADO_LABEL, notify, reload, esGerente, n
       </td>
       <td>{t.tipo_frecuencia === "horas" ? <span className={`badge ${ESTADO_BADGE[t.estado]}`}>{ESTADO_LABEL[t.estado]}</span> : <span style={{ color: "var(--muted2)", fontSize: 11 }}>Por fecha</span>}</td>
       <td>{t.es_critica ? <span className="badge b-red">Sí</span> : <span style={{ color: "var(--muted2)", fontSize: 11 }}>—</span>}</td>
-      <td><button className="btn btn-success btn-sm" onClick={() => setModalCumplir(true)}>✓ Cumplir</button></td>
+      <td className="flex-gap">
+        <button className="btn btn-success btn-sm" onClick={() => setModalCumplir(true)}>✓ Cumplir</button>
+        <button className="btn btn-ghost btn-sm" title="Historial de cumplimiento" onClick={() => setModalHistorial(true)}>🕘</button>
+      </td>
       {modalCumplir && createPortal(
         <CumplirTareaModal tarea={t} esGerente={esGerente} nombreUsuario={nombreUsuario} onClose={() => setModalCumplir(false)}
           onSave={() => { setModalCumplir(false); notify?.("Tarea dada por cumplida", "success"); reload?.(); }} />,
+        document.body
+      )}
+      {modalHistorial && createPortal(
+        <HistorialTareaModal tarea={t} onClose={() => setModalHistorial(false)} />,
         document.body
       )}
     </tr>
