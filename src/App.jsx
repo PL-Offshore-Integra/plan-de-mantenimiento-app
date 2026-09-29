@@ -708,6 +708,11 @@ function CumplirTareaModal({ tarea, esGerente, nombreUsuario, onClose, onSave })
 
   const sinHoras = !horasLoading && horas === null;
   const puedeCargarHoras = ultimo ? fecha >= ultimo.fecha : esGerente;
+  // Solo las tareas cuyo vencimiento se calcula por horas de funcionamiento
+  // necesitan la lectura de horas para poder cumplirse; las que vencen por
+  // fecha (ej: compás magnético) no dependen de eso y no deben bloquearse.
+  const requiereHoras = tarea.tipo_frecuencia === "horas";
+  const bloqueaGuardado = requiereHoras && sinHoras;
 
   const abrirEdicionHoras = () => {
     setHorasInput(!sinHoras ? String(Math.max(0, horas - (ultimo ? ultimo.horas : 0))) : "");
@@ -741,7 +746,7 @@ function CumplirTareaModal({ tarea, esGerente, nombreUsuario, onClose, onSave })
   const handleSave = async () => {
     if (!taller) return alert("Completá el taller interviniente");
     if (fecha > today()) return alert("No se puede registrar el cumplimiento con fecha futura. Elegí hoy o una fecha anterior.");
-    if (horasLoading || sinHoras) return;
+    if (horasLoading || bloqueaGuardado) return;
     setSaving(true);
     try {
       let adjunto_remito_url = "";
@@ -791,6 +796,16 @@ function CumplirTareaModal({ tarea, esGerente, nombreUsuario, onClose, onSave })
               ) : !sinHoras ? (
                 <input readOnly value={`${horas} hs · click para corregir`}
                   style={{ cursor: "pointer" }} onClick={abrirEdicionHoras} />
+              ) : !requiereHoras ? (
+                puedeCargarHoras ? (
+                  <div className="info-box" style={{ fontSize: 11, cursor: "pointer", textDecoration: "underline" }} onClick={abrirEdicionHoras}>
+                    Este equipo no tiene horas cargadas para el {fmtDate(fecha)} — no hace falta para esta tarea. Click para cargarlas de todos modos (opcional).
+                  </div>
+                ) : (
+                  <div className="info-box" style={{ fontSize: 11 }}>
+                    Sin horas cargadas para esta fecha (no hace falta para esta tarea, que vence por fecha).
+                  </div>
+                )
               ) : !puedeCargarHoras ? (
                 <div className="info-box danger" style={{ fontSize: 11 }}>
                   No hay horas cargadas de {tarea.mant_equipos?.nombre} para el {fmtDate(fecha)}.{" "}
@@ -814,7 +829,7 @@ function CumplirTareaModal({ tarea, esGerente, nombreUsuario, onClose, onSave })
         </div>
         <div className="mftr">
           <button className="btn btn-ghost" onClick={onClose}>Cancelar</button>
-          <button className="btn btn-primary" onClick={handleSave} disabled={saving || horasLoading || sinHoras}>{saving ? "Guardando..." : "Dar por cumplida"}</button>
+          <button className="btn btn-primary" onClick={handleSave} disabled={saving || horasLoading || bloqueaGuardado}>{saving ? "Guardando..." : "Dar por cumplida"}</button>
         </div>
       </div>
     </div>
