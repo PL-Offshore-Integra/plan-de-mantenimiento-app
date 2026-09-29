@@ -581,6 +581,19 @@ function calcEstado(tarea, horasActuales) {
   return { estado: "ok", restante, pct };
 }
 
+// Equivalente a calcEstado pero para tareas que vencen por fecha (no por
+// horas): el próximo vencimiento se proyecta como último cumplimiento +
+// frecuencia (interpretada en días a partir del texto libre).
+function calcEstadoFecha(tarea) {
+  const dias = parseFrecuenciaDias(tarea.frecuencia_texto);
+  if (!dias || !tarea.ultima_ejecucion_fecha) return { estado: "sin_datos", proximoVencimiento: null, restanteDias: null };
+  const proximoVencimiento = addDays(tarea.ultima_ejecucion_fecha, dias);
+  const restanteDias = Math.round((new Date(proximoVencimiento) - new Date(today())) / 86400000);
+  if (restanteDias < 0) return { estado: "vencida", proximoVencimiento, restanteDias };
+  if (restanteDias <= dias * 0.1) return { estado: "proxima", proximoVencimiento, restanteDias };
+  return { estado: "ok", proximoVencimiento, restanteDias };
+}
+
 function calcForecastFecha(restanteHs, promedioHsDiarias) {
   if (!restanteHs || restanteHs <= 0 || !promedioHsDiarias || promedioHsDiarias <= 0) return null;
   const diasRestantes = Math.ceil(restanteHs / promedioHsDiarias);
@@ -1489,13 +1502,14 @@ function FilaTarea({ t, ESTADO_BADGE, ESTADO_LABEL, notify, reload, esGerente, n
       <td style={{ fontSize: 12 }}>{t.descripcion}</td>
       <td className="text-mono" style={{ fontSize: 11, color: "var(--blue)" }}>{t.tipo_frecuencia === "horas" ? `${t.frecuencia_hs} hs` : t.frecuencia_texto}</td>
       <td className="text-mono" style={{ fontSize: 11, color: "var(--muted)" }}>{t.tipo_frecuencia === "horas" ? `${t.horasActuales} hs` : "—"}</td>
+      <td className="text-mono" style={{ fontSize: 11, color: "var(--muted)" }}>{t.ultima_ejecucion_fecha ? fmtDate(t.ultima_ejecucion_fecha) : "—"}</td>
       <td className="text-mono" style={{ fontSize: 11, fontWeight: 600, color: t.estado === "vencida" ? "var(--danger)" : t.estado === "proxima" ? "var(--warn)" : "var(--muted)" }}>
-        {t.tipo_frecuencia !== "horas" ? (t.ultima_ejecucion_fecha ? fmtDate(t.ultima_ejecucion_fecha) : "—")
-          : t.estado === "sin_datos" ? "—"
-          : t.restante < 0 ? `Vencida hace ${Math.abs(Math.round(t.restante))} hs`
-          : `Faltan ${Math.round(t.restante)} hs`}
+        {t.estado === "sin_datos" || !t.estado ? "—"
+          : t.tipo_frecuencia === "horas"
+            ? (t.restante < 0 ? `Vencida hace ${Math.abs(Math.round(t.restante))} hs` : `Faltan ${Math.round(t.restante)} hs`)
+            : (t.estado === "vencida" ? `Vencida desde el ${fmtDate(t.proximoVencimiento)}` : `Vence el ${fmtDate(t.proximoVencimiento)}`)}
       </td>
-      <td>{t.tipo_frecuencia === "horas" ? <span className={`badge ${ESTADO_BADGE[t.estado]}`}>{ESTADO_LABEL[t.estado]}</span> : <span style={{ color: "var(--muted2)", fontSize: 11 }}>Por fecha</span>}</td>
+      <td>{t.estado ? <span className={`badge ${ESTADO_BADGE[t.estado]}`}>{ESTADO_LABEL[t.estado]}</span> : <span style={{ color: "var(--muted2)", fontSize: 11 }}>—</span>}</td>
       <td>{t.es_critica ? <span className="badge b-red">Sí</span> : <span style={{ color: "var(--muted2)", fontSize: 11 }}>—</span>}</td>
       <td className="flex-gap">
         <button className="btn btn-success btn-sm" onClick={() => setModalCumplir(true)}>✓ Cumplir</button>
@@ -1518,7 +1532,7 @@ function TablaTareas({ tareas, ESTADO_BADGE, ESTADO_LABEL, notify, reload, esGer
   return (
     <div className="table-wrap">
       <table>
-        <thead><tr>{modoSeleccion && <th></th>}<th>Código</th><th>Descripción</th><th>Frecuencia</th><th>Horas actuales</th><th>Restante</th><th>Estado</th><th>Crítica</th><th></th></tr></thead>
+        <thead><tr>{modoSeleccion && <th></th>}<th>Código</th><th>Descripción</th><th>Frecuencia</th><th>Horas actuales</th><th>Último cumplimiento</th><th>Restante</th><th>Estado</th><th>Crítica</th><th></th></tr></thead>
         <tbody>{tareas.map(t => <FilaTarea key={t.id} t={t} ESTADO_BADGE={ESTADO_BADGE} ESTADO_LABEL={ESTADO_LABEL} notify={notify} reload={reload} esGerente={esGerente} nombreUsuario={nombreUsuario} modoSeleccion={modoSeleccion} seleccionados={seleccionados} onToggleSeleccion={onToggleSeleccion} heredado={heredado} />)}</tbody>
       </table>
     </div>
@@ -1841,7 +1855,8 @@ function PagePlan({ buque, notify, esGerente, nombreUsuario }) {
       const estado = calcEstado(t, horasActuales);
       return { ...t, horasActuales, ...estado };
     }
-    return { ...t, horasActuales: null, estado: null, restante: null, pct: 0 };
+    const estadoFecha = calcEstadoFecha(t);
+    return { ...t, horasActuales: null, restante: null, pct: 0, ...estadoFecha };
   });
 
   const sectores = [...new Set(equipos.map(e => e.sector).filter(Boolean))].sort();
