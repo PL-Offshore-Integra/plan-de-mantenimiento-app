@@ -1689,6 +1689,19 @@ async function generarReportePDF({ buque, tareas, horasMap, modo, valorModo }) {
   const porTarea = {};
   for (const e of ejecucionesTodas) (porTarea[e.tarea_id] ??= []).push(e);
 
+  // Para proyectar una fecha estimada de vencimiento en las tareas por horas
+  // (no vencidas) se usa el promedio de hs/día de cada equipo, igual que en
+  // el Dashboard.
+  const equiposParaForecast = [...new Set(
+    tareas.filter(t => t.tipo_frecuencia === "horas" && t.estado && t.estado !== "sin_datos" && t.restante > 0).map(t => t.equipo_id)
+  )];
+  const promedios = {};
+  await Promise.all(equiposParaForecast.map(async id => {
+    try { promedios[id] = await api.getPromedioHorasDiarias(buque.id, id); } catch { /* sin promedio */ }
+  }));
+  const ESTADO_LABEL_PDF = { vencida: "Vencida", proxima: "Próxima a vencer", ok: "Al día", sin_datos: "Sin datos" };
+  const ESTADO_COLOR_PDF = { vencida: [180, 40, 40], proxima: [190, 130, 20], ok: [30, 120, 90] };
+
   doc.addPage();
   doc.setTextColor(...AZUL_PL).setFontSize(15).setFont(undefined, "bold");
   doc.text("Historial de cumplimiento", 14, 34);
@@ -1725,6 +1738,25 @@ async function generarReportePDF({ buque, tareas, horasMap, modo, valorModo }) {
     doc.text(`${t.codigo || "s/código"} · ${t.descripcion}`, 14, y);
     doc.setTextColor(0);
     y += 8;
+
+    let proximoTexto = "Sin datos";
+    if (t.tipo_frecuencia === "horas") {
+      if (t.estado && t.estado !== "sin_datos") {
+        if (t.restante < 0) proximoTexto = `Vencida hace ${Math.abs(Math.round(t.restante))} hs`;
+        else {
+          const forecast = calcForecastFecha(t.restante, promedios[t.equipo_id]);
+          proximoTexto = forecast ? `${fmtDate(forecast)} (faltan ${Math.round(t.restante)} hs)` : `Faltan ${Math.round(t.restante)} hs`;
+        }
+      }
+    } else if (t.proximoVencimiento) {
+      proximoTexto = fmtDate(t.proximoVencimiento);
+    }
+    doc.setFontSize(9).setFont(undefined, "normal").setTextColor(...GRIS_TEXTO);
+    doc.text(`Próximo vencimiento: ${proximoTexto}`, 14, y);
+    doc.setFont(undefined, "bold").setTextColor(...(ESTADO_COLOR_PDF[t.estado] || GRIS_TEXTO));
+    doc.text(ESTADO_LABEL_PDF[t.estado] || "Sin datos", pageWidth - 14, y, { align: "right" });
+    doc.setTextColor(0);
+    y += 7;
 
     if (ejec.length === 0) {
       doc.setFontSize(9).setFont(undefined, "normal").setTextColor(...GRIS_TEXTO);
