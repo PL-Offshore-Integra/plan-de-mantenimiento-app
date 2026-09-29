@@ -728,24 +728,28 @@ function CumplirTareaModal({ tarea, esGerente, nombreUsuario, onClose, onSave })
   const bloqueaGuardado = requiereHoras && sinHoras;
 
   const abrirEdicionHoras = () => {
-    setHorasInput(!sinHoras ? String(Math.max(0, horas - (ultimo ? ultimo.horas : 0))) : "");
+    setHorasInput(!sinHoras ? String(horas) : "");
     setEditandoHoras(true);
   };
 
+  // A diferencia de "Carga de horas" (que pide el delta trabajado ese día),
+  // acá se pide la lectura absoluta del cuentahoras en el momento del
+  // mantenimiento — es lo que el tripulante tiene naturalmente a la vista.
+  // El tope de 24 hs/día se sigue validando internamente contra el delta
+  // implícito (ingresado - último registro).
   const confirmarHoras = async () => {
     if (cargandoHoras) return;
     if (horasInput === "") { setEditandoHoras(false); return; }
     const ingresado = parseInt(horasInput);
     if (isNaN(ingresado) || ingresado < 0) return alert("Ingresá un valor de horas válido");
-    let horasFinal;
-    if (!ultimo) {
-      horasFinal = ingresado;
-    } else {
+    if (ultimo) {
+      const delta = ingresado - ultimo.horas;
+      if (delta < 0) return alert(`Las horas actuales (${ingresado} hs) no pueden ser menores a la última lectura registrada: ${ultimo.horas} hs, el ${fmtDate(ultimo.fecha)}.`);
       const dias = Math.max(1, Math.round((new Date(fecha) - new Date(ultimo.fecha)) / 86400000));
       const maxPermitido = HORAS_MAX_POR_DIA * dias;
-      if (ingresado > maxPermitido) return alert(`Supera el máximo de ${HORAS_MAX_POR_DIA} hs de funcionamiento por día.\n\nTope permitido: ${maxPermitido} hs (${dias} día/s desde el ${fmtDate(ultimo.fecha)}).`);
-      horasFinal = ultimo.horas + ingresado;
+      if (delta > maxPermitido) return alert(`El aumento de horas (${delta} hs) supera el máximo de ${HORAS_MAX_POR_DIA} hs de funcionamiento por día.\n\nTope permitido: ${maxPermitido} hs de aumento (${dias} día/s desde el ${fmtDate(ultimo.fecha)}, que tenía ${ultimo.horas} hs).`);
     }
+    const horasFinal = ingresado;
     setCargandoHoras(true);
     try {
       await api.registrarHoras([{ buque_id: buqueId, equipo_id: tarea.equipo_id, horas: horasFinal, fecha, registrado_por: nombreUsuario }]);
@@ -799,7 +803,7 @@ function CumplirTareaModal({ tarea, esGerente, nombreUsuario, onClose, onSave })
                 <input disabled value="Buscando..." />
               ) : editandoHoras ? (
                 <div className={`flex-gap ${sinHoras ? "info-box danger" : ""}`} style={{ fontSize: 11 }}>
-                  <span>{!ultimo ? "Horas del equipo:" : "Horas trabajadas ese día:"}</span>
+                  <span>Horas actuales del equipo:</span>
                   <input type="number" min={0} autoFocus disabled={cargandoHoras}
                     value={horasInput} onChange={e => setHorasInput(e.target.value)}
                     onKeyDown={e => e.key === "Enter" && confirmarHoras()}
@@ -828,7 +832,7 @@ function CumplirTareaModal({ tarea, esGerente, nombreUsuario, onClose, onSave })
                 </div>
               ) : (
                 <div className="info-box danger" style={{ fontSize: 11, cursor: "pointer", textDecoration: "underline" }} onClick={abrirEdicionHoras}>
-                  No hay horas cargadas de {tarea.mant_equipos?.nombre} para el {fmtDate(fecha)}. Click para cargar las horas {!ultimo ? "iniciales" : "trabajadas ese día"}.
+                  No hay horas cargadas de {tarea.mant_equipos?.nombre} para el {fmtDate(fecha)}. Click para cargar las horas actuales.
                 </div>
               )}
             </FG>
