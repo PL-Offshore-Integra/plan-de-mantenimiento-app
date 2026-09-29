@@ -757,7 +757,7 @@ function CumplirTareaModal({ tarea, esGerente, nombreUsuario, onClose, onSave })
   };
 
   const handleSave = async () => {
-    if (!taller) return alert("Completá el taller interviniente");
+    if (!taller) return alert("Completá quién realizó el trabajo");
     if (fecha > today()) return alert("No se puede registrar el cumplimiento con fecha futura. Elegí hoy o una fecha anterior.");
     if (horasLoading || bloqueaGuardado) return;
     setSaving(true);
@@ -832,7 +832,7 @@ function CumplirTareaModal({ tarea, esGerente, nombreUsuario, onClose, onSave })
                 </div>
               )}
             </FG>
-            <FG label="Taller interviniente *"><input value={taller} onChange={e => setTaller(e.target.value)} placeholder="Ej: Taller Naval SRL" /></FG>
+            <FG label="Realizado por *"><input value={taller} onChange={e => setTaller(e.target.value)} placeholder="Ej: Juan Pérez / Taller Naval SRL" /></FG>
             <FG label="N° de remito"><input value={remito} onChange={e => setRemito(e.target.value)} placeholder="Ej: 0001-00012345" /></FG>
           </div>
           <FG label="Observaciones" full><textarea value={observaciones} onChange={e => setObservaciones(e.target.value)} placeholder="Notas del trabajo realizado..." /></FG>
@@ -858,17 +858,17 @@ function calcularCumplimientos(ejecuciones, tarea) {
   const ascendente = [...ejecuciones].sort((a, b) => a.fecha < b.fecha ? -1 : a.fecha > b.fecha ? 1 : 0);
   const diasFrecuencia = tarea.tipo_frecuencia !== "horas" ? parseFrecuenciaDias(tarea.frecuencia_texto) : null;
   const conCumplimiento = ascendente.map((e, i) => {
-    if (i === 0) return { ...e, cumplimiento: null };
+    if (i === 0) return { ...e, cumplimiento: null, anteriorFecha: null };
     const prev = ascendente[i - 1];
     if (tarea.tipo_frecuencia === "horas" && tarea.frecuencia_hs && e.horas_equipo != null && prev.horas_equipo != null) {
       const diff = (prev.horas_equipo + tarea.frecuencia_hs) - e.horas_equipo;
-      return { ...e, cumplimiento: { aTiempo: diff >= 0, valor: Math.abs(diff), unidad: "hs" } };
+      return { ...e, cumplimiento: { aTiempo: diff >= 0, valor: Math.abs(diff), unidad: "hs" }, anteriorFecha: prev.fecha };
     }
     if (tarea.tipo_frecuencia !== "horas" && diasFrecuencia) {
       const diffDias = Math.round((new Date(addDays(prev.fecha, diasFrecuencia)) - new Date(e.fecha)) / 86400000);
-      return { ...e, cumplimiento: { aTiempo: diffDias >= 0, valor: Math.abs(diffDias), unidad: "días" } };
+      return { ...e, cumplimiento: { aTiempo: diffDias >= 0, valor: Math.abs(diffDias), unidad: "días" }, anteriorFecha: prev.fecha };
     }
-    return { ...e, cumplimiento: null };
+    return { ...e, cumplimiento: null, anteriorFecha: prev.fecha };
   });
   return conCumplimiento.reverse();
 }
@@ -1630,6 +1630,14 @@ const ESTILO_TABLA = {
   styles: { fontSize: 9, cellPadding: 3, textColor: [40, 45, 50] },
 };
 
+// Responsable de cada sector a los fines del reporte: máquinas queda a cargo
+// del Jefe de Máquinas, y cubierta/puente a cargo del Capitán.
+function responsablePorSector(sector) {
+  if (sector === "MAQ") return "Jefe de Máquinas";
+  if (sector === "CUB" || sector === "PUENTE") return "Capitán";
+  return "—";
+}
+
 // Genera y descarga el PDF del reporte: carátula, resumen de horas actuales
 // de los equipos involucrados, y el historial de cada tarea seleccionada
 // (recortado según el modo elegido: última vez / desde una fecha / últimas N).
@@ -1766,24 +1774,19 @@ async function generarReportePDF({ buque, tareas, horasMap, modo, valorModo }) {
       continue;
     }
 
+    const periodicidadTexto = t.tipo_frecuencia === "horas" ? `${t.frecuencia_hs} hs` : (t.frecuencia_texto || "—");
+    const responsable = responsablePorSector(t.mant_equipos?.sector);
     const filas = ejec.map(e => [
       fmtDate(e.fecha),
+      e.anteriorFecha ? fmtDate(e.anteriorFecha) : "—",
       e.horas_equipo != null ? `${e.horas_equipo} hs` : "—",
-      !e.cumplimiento ? "—" : (e.cumplimiento.aTiempo
-        ? `A tiempo (${e.cumplimiento.valor} ${e.cumplimiento.unidad} antes)`
-        : `Vencida (${e.cumplimiento.valor} ${e.cumplimiento.unidad} después)`),
+      periodicidadTexto,
+      responsable,
     ]);
     autoTable(doc, {
-      startY: y, head: [["Fecha", "Horas del equipo", "Cumplimiento"]], body: filas,
+      startY: y, head: [["Realizado", "Mantenimiento previo", "Horas del equipo", "Periodicidad", "Cumplimiento"]], body: filas,
       margin: { left: 14, right: 14, top: 26 },
       ...ESTILO_TABLA,
-      didParseCell: (data) => {
-        if (data.section === "body" && data.column.index === 2) {
-          const val = data.cell.raw;
-          if (typeof val === "string" && val.startsWith("Vencida")) data.cell.styles.textColor = [180, 40, 40];
-          else if (typeof val === "string" && val.startsWith("A tiempo")) data.cell.styles.textColor = [30, 120, 90];
-        }
-      },
     });
     y = doc.lastAutoTable.finalY + 10;
   }
