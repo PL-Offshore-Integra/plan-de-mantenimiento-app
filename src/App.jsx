@@ -1509,7 +1509,7 @@ function FilaTarea({ t, ESTADO_BADGE, ESTADO_LABEL, notify, reload, esGerente, n
             ? (t.restante < 0 ? `Vencida hace ${Math.abs(Math.round(t.restante))} hs` : `Faltan ${Math.round(t.restante)} hs`)
             : (t.estado === "vencida" ? `Vencida desde el ${fmtDate(t.proximoVencimiento)}` : `Vence el ${fmtDate(t.proximoVencimiento)}`)}
       </td>
-      <td>{t.estado ? <span className={`badge ${ESTADO_BADGE[t.estado]}`}>{ESTADO_LABEL[t.estado]}</span> : <span style={{ color: "var(--muted2)", fontSize: 11 }}>—</span>}</td>
+      <td>{t.estado && t.estado !== "sin_datos" ? <span className={`badge ${ESTADO_BADGE[t.estado]}`}>{ESTADO_LABEL[t.estado]}</span> : <span style={{ color: "var(--muted2)", fontSize: 11 }}>—</span>}</td>
       <td>{t.es_critica ? <span className="badge b-red">Sí</span> : <span style={{ color: "var(--muted2)", fontSize: 11 }}>—</span>}</td>
       <td className="flex-gap">
         <button className="btn btn-success btn-sm" onClick={() => setModalCumplir(true)}>✓ Cumplir</button>
