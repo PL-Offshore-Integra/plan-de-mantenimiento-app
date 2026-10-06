@@ -1365,23 +1365,141 @@ function PageHoras({ buque, notify, esGerente, nombreUsuario }) {
 }
 
 //  PAGE: KPIs 
+// Genera los "eventos de vencimiento" de cada tarea, cada uno con la fecha que
+// lo ubica en un período y si terminó fuera de término:
+// - Tareas por fecha: cada cumplimiento (salvo el primero, sin referencia
+//   previa) responde a un vencimiento = cumplimiento anterior + frecuencia; es
+//   fuera de término si se hizo después. El vencimiento pendiente (último
+//   cumplimiento + frecuencia) también cuenta: vencido y sin hacer = fuera de
+//   término; todavía por llegar = en término, ubicado en su mes/trimestre.
+// - Tareas por horas: no hay fecha calendario de vencimiento, así que cada
+//   cumplimiento se ubica en la fecha en que se hizo, y las tareas hoy vencidas
+//   (sin cumplir) cuentan como fuera de término en el período actual.
+// Las tareas que nunca se cumplieron no tienen punto de partida, por lo que
+// todavía no generan vencimientos.
+function calcularEventosVencimiento(tareas, ejecuciones, horasMap) {
+  const porTarea = {};
+  for (const e of ejecuciones) (porTarea[e.tarea_id] ??= []).push(e);
+  const hoy = today();
+  const eventos = [];
+  for (const t of tareas) {
+    const asc = [...(porTarea[t.id] || [])].sort((a, b) => a.fecha < b.fecha ? -1 : a.fecha > b.fecha ? 1 : 0);
+    if (t.tipo_frecuencia === "horas") {
+      if (!t.frecuencia_hs) continue;
+      for (let i = 1; i < asc.length; i++) {
+        const prev = asc[i - 1], e = asc[i];
+        if (e.horas_equipo == null || prev.horas_equipo == null) continue;
+        eventos.push({ fecha: e.fecha, fuera: e.horas_equipo > prev.horas_equipo + t.frecuencia_hs });
+      }
+      if (calcEstado(t, horasMap[t.equipo_id] || 0).estado === "vencida") eventos.push({ fecha: hoy, fuera: true });
+    } else {
+      const dias = parseFrecuenciaDias(t.frecuencia_texto);
+      if (!dias || asc.length === 0) continue;
+      for (let i = 1; i < asc.length; i++) {
+        const vence = addDays(asc[i - 1].fecha, dias);
+        eventos.push({ fecha: vence, fuera: asc[i].fecha > vence });
+      }
+      const vencePendiente = addDays(asc[asc.length - 1].fecha, dias);
+      eventos.push({ fecha: vencePendiente, fuera: vencePendiente < hoy });
+    }
+  }
+  return eventos;
+}
+
+const MESES_CORTOS = ["ene", "feb", "mar", "abr", "may", "jun", "jul", "ago", "sep", "oct", "nov", "dic"];
+
+// Devuelve los últimos `cantidad` períodos (más reciente primero) con el total
+// de tareas que vencían y cuántas terminaron fuera de término.
+function resumenOverdue(eventos, tipo, cantidad) {
+  const hoy = new Date(today() + "T00:00:00");
+  let anio = hoy.getFullYear(), idx = tipo === "mensual" ? hoy.getMonth() : Math.floor(hoy.getMonth() / 3);
+  const porPeriodo = (ev) => {
+    const y = ev.fecha.slice(0, 4), m = parseInt(ev.fecha.slice(5, 7)) - 1;
+    return tipo === "mensual" ? `${y}-${m}` : `${y}-${Math.floor(m / 3)}`;
+  };
+  const filas = [];
+  for (let n = 0; n < cantidad; n++) {
+    const clave = `${anio}-${idx}`;
+    const delPeriodo = eventos.filter(ev => porPeriodo(ev) === clave);
+    const fuera = delPeriodo.filter(ev => ev.fuera).length;
+    filas.push({
+      etiqueta: tipo === "mensual" ? `${MESES_CORTOS[idx]} ${anio}` : `T${idx + 1} ${anio} (${MESES_CORTOS[idx * 3]}–${MESES_CORTOS[idx * 3 + 2]})`,
+      total: delPeriodo.length, fuera,
+      pct: delPeriodo.length ? Math.round(fuera / delPeriodo.length * 100) : null,
+    });
+    idx -= 1;
+    if (idx < 0) { idx = tipo === "mensual" ? 11 : 3; anio -= 1; }
+  }
+  return filas;
+}
+
+function TablaOverdue({ titulo, descripcion, filas }) {
+  const colorPct = (p) => p === null ? "var(--muted2)" : p > 20 ? "var(--danger)" : p > 10 ? "var(--warn)" : "var(--accent2)";
+  return (
+    <div className="card">
+      <div className="card-title">{titulo}</div>
+      <div style={{ fontSize: 11, color: "var(--muted)", marginBottom: 10 }}>{descripcion}</div>
+      <div className="table-wrap">
+        <table>
+          <thead><tr><th>Período</th><th>Tareas con vencimiento</th><th>Fuera de término</th><th>% Overdue</th></tr></thead>
+          <tbody>
+            {filas.map(f => (
+              <tr key={f.etiqueta}>
+                <td style={{ fontWeight: 500 }}>{f.etiqueta}</td>
+                <td className="text-mono">{f.total}</td>
+                <td className="text-mono">{f.fuera}</td>
+                <td className="text-mono" style={{ fontWeight: 600, color: colorPct(f.pct) }}>{f.pct === null ? "—" : `${f.pct}%`}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
 function PageKPIs({ buque }) {
   const [ejecuciones, setEjecuciones] = useState([]);
+  const [tareas, setTareas] = useState([]);
+  const [horasMap, setHorasMap] = useState({});
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    api.getEjecuciones(buque.id).then(d => { setEjecuciones(d); setLoading(false); });
+    Promise.all([api.getEjecuciones(buque.id), api.getTareas(buque.id), api.getUltimasHoras(buque.id)])
+      .then(([e, t, h]) => { setEjecuciones(e); setTareas(t); setHorasMap(h); setLoading(false); });
   }, [buque.id]);
 
   if (loading) return <div className="loading"><span className="spin">◌</span> Cargando...</div>;
+
+  const eventos = calcularEventosVencimiento(tareas, ejecuciones, horasMap);
+  const filasMensual = resumenOverdue(eventos, "mensual", 12);
+  const filasQ = resumenOverdue(eventos, "trimestral", 4);
+  const descripcionOverdue = "Tareas cumplidas fuera de término (o vencidas y sin cumplir) sobre el total de tareas cuyo vencimiento cae en el período.";
 
   const fueraTerm = ejecuciones.filter(e => e.fue_fuera_termino);
   const enTerm = ejecuciones.filter(e => !e.fue_fuera_termino);
   const pctFuera = ejecuciones.length ? Math.round(fueraTerm.length / ejecuciones.length * 100) : 0;
   const conMatriz = fueraTerm.filter(e => e.adjunto_riesgo_url);
 
+  const colorStat = (p) => p === null ? "var(--muted2)" : p > 20 ? "var(--danger)" : p > 10 ? "var(--warn)" : "var(--accent2)";
+
   return (
     <div>
+      <div className="stats">
+        <div className="stat">
+          <div className="stat-label">Overdue Task Mensual · {filasMensual[0].etiqueta}</div>
+          <div className="stat-value" style={{ color: colorStat(filasMensual[0].pct) }}>{filasMensual[0].pct === null ? "—" : `${filasMensual[0].pct}%`}</div>
+          <div style={{ fontSize: 10, color: "var(--muted)" }}>{filasMensual[0].fuera} de {filasMensual[0].total} tareas</div>
+        </div>
+        <div className="stat">
+          <div className="stat-label">Overdue Task Q · {filasQ[0].etiqueta}</div>
+          <div className="stat-value" style={{ color: colorStat(filasQ[0].pct) }}>{filasQ[0].pct === null ? "—" : `${filasQ[0].pct}%`}</div>
+          <div style={{ fontSize: 10, color: "var(--muted)" }}>{filasQ[0].fuera} de {filasQ[0].total} tareas</div>
+        </div>
+      </div>
+      <TablaOverdue titulo="Overdue Task Mensual" descripcion={descripcionOverdue} filas={filasMensual} />
+      <TablaOverdue titulo="Overdue Task Q (trimestral)" descripcion={descripcionOverdue} filas={filasQ} />
+
       <div className="stats">
         <div className="stat"><div className="stat-label">Total ejecuciones</div><div className="stat-value" style={{ color: "var(--blue)" }}>{ejecuciones.length}</div></div>
         <div className="stat"><div className="stat-label">En término</div><div className="stat-value" style={{ color: "var(--accent2)" }}>{enTerm.length}</div></div>
