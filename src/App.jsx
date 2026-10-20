@@ -3,6 +3,7 @@ import { createPortal } from "react-dom";
 import jsPDF from "jspdf";
 import autoTable from "jspdf-autotable";
 import { supabase } from "./lib/supabase";
+import { ArchivoLink } from "./lib/archivos";
 import { TAXONOMIA_TECNICA } from "./lib/taxonomiaTecnica";
 
 const NOMBRE_TRIPULACION = "Jefe de Máquinas";
@@ -1523,7 +1524,7 @@ function PageKPIs({ buque }) {
                     <td style={{ fontSize: 11 }}>{e.realizado_por || "—"}</td>
                     <td>
                       {e.adjunto_riesgo_url
-                        ? <a href={e.adjunto_riesgo_url} target="_blank" rel="noreferrer" style={{ fontSize: 11, color: "var(--blue)", textDecoration: "none" }}>Ver PDF</a>
+                        ? <ArchivoLink href={e.adjunto_riesgo_url} target="_blank" rel="noreferrer" style={{ fontSize: 11, color: "var(--blue)", textDecoration: "none" }}>Ver PDF</ArchivoLink>
                         : <span style={{ fontSize: 11, color: "var(--muted2)" }}>Sin adjunto</span>
                       }
                     </td>
@@ -2229,7 +2230,7 @@ function PageHistorial({ buque }) {
                     <td className="text-mono" style={{ fontSize: 11, color: "var(--blue)" }}>{e.horas_equipo ? `${e.horas_equipo} hs` : "—"}</td>
                     <td style={{ fontSize: 11 }}>{e.realizado_por || "—"}</td>
                     <td>{e.fue_fuera_termino ? <span className="badge b-red">{e.dias_fuera_termino || "?"} días</span> : <span className="badge b-green">En término</span>}</td>
-                    <td>{e.adjunto_riesgo_url ? <a href={e.adjunto_riesgo_url} target="_blank" rel="noreferrer" style={{ fontSize: 11, color: "var(--blue)" }}>Ver</a> : <span style={{ fontSize: 11, color: "var(--muted2)" }}>—</span>}</td>
+                    <td>{e.adjunto_riesgo_url ? <ArchivoLink href={e.adjunto_riesgo_url} target="_blank" rel="noreferrer" style={{ fontSize: 11, color: "var(--blue)" }}>Ver</ArchivoLink> : <span style={{ fontSize: 11, color: "var(--muted2)" }}>—</span>}</td>
                   </tr>
                 ))}
               </tbody>
